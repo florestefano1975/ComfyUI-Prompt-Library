@@ -171,10 +171,73 @@ class PromptLibraryNode:
         return (prefix.strip(), "")
 
 
+class PromptLibraryRandomNode:
+    """
+    Picks a random prompt from one or more selected categories
+    every time the workflow runs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                # Comma-separated category IDs chosen in the UI
+                "category_ids": ("STRING", {"default": ""}),
+                # -1 = truly random each run, any other value = fixed seed
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
+            },
+            "optional": {
+                "prefix": ("STRING", {"default": "", "multiline": False}),
+                "suffix": ("STRING", {"default": "", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("positive", "negative", "prompt_title", "prompt_id")
+    FUNCTION = "pick_random"
+    CATEGORY = "utils/prompts"
+    OUTPUT_NODE = False
+
+    def pick_random(self, category_ids, seed=-1, prefix="", suffix=""):
+        import random
+
+        library = load_library()
+
+        if not category_ids.strip():
+            return ("", "", "", "")
+
+        selected_ids = [cid.strip() for cid in category_ids.split(",") if cid.strip()]
+
+        # Collect all descendant category ids
+        def get_descendants(cid):
+            ids = {cid}
+            for c in library["categories"]:
+                if c.get("parent_id") == cid:
+                    ids |= get_descendants(c["id"])
+            return ids
+
+        all_cat_ids = set()
+        for cid in selected_ids:
+            all_cat_ids |= get_descendants(cid)
+
+        pool = [p for p in library["prompts"] if p.get("category_id") in all_cat_ids]
+
+        if not pool:
+            return ("", "", "", "")
+
+        rng = random.Random(seed if seed != -1 else None)
+        chosen = rng.choice(pool)
+
+        positive = " ".join(filter(None, [prefix.strip(), chosen["text"].strip(), suffix.strip()]))
+        return (positive, chosen.get("negative", ""), chosen.get("title", ""), chosen["id"])
+
+
 NODE_CLASS_MAPPINGS = {
     "PromptLibraryNode": PromptLibraryNode,
+    "PromptLibraryRandomNode": PromptLibraryRandomNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptLibraryNode": "📚 Prompt Library",
+    "PromptLibraryRandomNode": "🎲 Prompt Library — Random",
 }

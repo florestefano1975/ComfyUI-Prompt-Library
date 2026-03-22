@@ -68,6 +68,19 @@ let state = {
   activeTab: "browse", // browse | edit
 };
 
+// Per-node random state (keyed by node id)
+const randomStates = {};
+function getRandomState(nodeId) {
+  if (!randomStates[nodeId]) {
+    randomStates[nodeId] = {
+      selectedCategoryIds: new Set(),
+      expandedCategories: new Set(),
+      previewPrompts: [],
+    };
+  }
+  return randomStates[nodeId];
+}
+
 // ──────────────────────────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────────────────────────
@@ -632,66 +645,336 @@ class PromptLibraryPanel {
 }
 
 // ──────────────────────────────────────────────────────────────────
+//  Random Panel
+// ──────────────────────────────────────────────────────────────────
+class PromptLibraryRandomPanel {
+  constructor(node) {
+    this.node = node;
+    this.container = null;
+    this.rs = null; // random state for this node instance
+  }
+
+  async init() {
+    // Ensure shared library data is loaded
+    if (!state.categories.length && !state.prompts.length) {
+      const data = await API.get();
+      state.categories = data.categories || [];
+      state.prompts = data.prompts || [];
+    }
+    this.rs = getRandomState(this.node.id);
+    this._syncFromWidget();
+    this.render();
+  }
+
+  // Read category_ids widget → populate rs.selectedCategoryIds
+  _syncFromWidget() {
+    const w = this.node.widgets?.find((w) => w.name === "category_ids");
+    if (w && w.value) {
+      this.rs.selectedCategoryIds = new Set(
+        w.value.split(",").map((s) => s.trim()).filter(Boolean)
+      );
+    }
+  }
+
+  // Write rs.selectedCategoryIds → category_ids widget
+  _flushToWidget() {
+    const w = this.node.widgets?.find((w) => w.name === "category_ids");
+    if (w) {
+      w.value = [...this.rs.selectedCategoryIds].join(",");
+      this.node.setDirtyCanvas?.(true);
+    }
+  }
+
+  _getPool() {
+    if (!this.rs.selectedCategoryIds.size) return [];
+    const allIds = new Set();
+    for (const cid of this.rs.selectedCategoryIds) {
+      getAllDescendantIds(cid).forEach((id) => allIds.add(id));
+    }
+    return state.prompts.filter((p) => allIds.has(p.category_id));
+  }
+
+  render() {
+    if (!this.container) return;
+
+    // Partial update: only rebuild body if wrap already exists
+    const existing = this.container.querySelector(".plr-wrap");
+    if (!existing) {
+      this.container.innerHTML = "";
+      this.container.appendChild(this._buildFull());
+      return;
+    }
+
+    // Replace only the category tree and the pool preview
+    const newTree = this._buildCategoryTree();
+    const oldTree = existing.querySelector(".plr-tree-wrap");
+    if (oldTree) existing.querySelector(".plr-main").replaceChild(newTree, oldTree);
+
+    const newPool = this._buildPool();
+    const oldPool = existing.querySelector(".plr-pool-wrap");
+    if (oldPool) existing.querySelector(".plr-main").replaceChild(newPool, oldPool);
+  }
+
+  _buildFull() {
+    const wrap = document.createElement("div");
+    wrap.className = "plr-wrap";
+    wrap.appendChild(this._buildHeader());
+    const main = document.createElement("div");
+    main.className = "plr-main";
+    main.appendChild(this._buildCategoryTree());
+    main.appendChild(this._buildPool());
+    wrap.appendChild(main);
+    return wrap;
+  }
+
+  // ── Header ──────────────────────────────────────────────────────
+  _buildHeader() {
+    const h = document.createElement("div");
+    h.className = "plr-header";
+    h.innerHTML = `
+      <div class="plr-header-title">
+        <span class="pl-icon">🎲</span>
+        <span>Random Prompt</span>
+      </div>
+      <div class="plr-header-sub">
+        Select categories — a random prompt is picked on each run
+      </div>
+    `;
+    return h;
+  }
+
+  // ── Category tree with checkboxes ────────────────────────────────
+  _buildCategoryTree() {
+    const wrap = document.createElement("div");
+    wrap.className = "plr-tree-wrap";
+
+    const title = document.createElement("div");
+    title.className = "plr-section-title";
+    const totalSelected = this.rs.selectedCategoryIds.size;
+    const pool = this._getPool();
+    title.innerHTML = `
+      <span>Categories</span>
+      <span class="plr-badge">${totalSelected} selected · ${pool.length} prompt${pool.length !== 1 ? "s" : ""} in pool</span>
+    `;
+    wrap.appendChild(title);
+
+    // Select all / none
+    const actions = document.createElement("div");
+    actions.className = "plr-tree-actions";
+    const allLeafIds = state.categories.map((c) => c.id);
+    actions.innerHTML = `
+      <button class="pl-btn plr-sm-btn" id="plr-sel-all">Select all</button>
+      <button class="pl-btn plr-sm-btn" id="plr-sel-none">Clear</button>
+    `;
+    actions.querySelector("#plr-sel-all").addEventListener("click", () => {
+      allLeafIds.forEach((id) => this.rs.selectedCategoryIds.add(id));
+      this._flushToWidget();
+      this.render();
+    });
+    actions.querySelector("#plr-sel-none").addEventListener("click", () => {
+      this.rs.selectedCategoryIds.clear();
+      this._flushToWidget();
+      this.render();
+    });
+    wrap.appendChild(actions);
+
+    const tree = document.createElement("div");
+    tree.className = "plr-tree";
+    getRootCategories().forEach((cat) => tree.appendChild(this._buildCatRow(cat, 0)));
+    wrap.appendChild(tree);
+    return wrap;
+  }
+
+  _buildCatRow(cat, depth) {
+    const children = getChildCategories(cat.id);
+    const hasChildren = children.length > 0;
+    const expanded = this.rs.expandedCategories.has(cat.id);
+    const checked = this.rs.selectedCategoryIds.has(cat.id);
+    const subtreeCount = getPromptsInSubtree(cat.id).length;
+
+    const wrap = document.createElement("div");
+
+    const row = document.createElement("label");
+    row.className = "plr-cat-row" + (checked ? " checked" : "");
+    row.style.paddingLeft = `${10 + depth * 16}px`;
+    row.innerHTML = `
+      <span class="plr-toggle">${hasChildren ? (expanded ? "▾" : "▸") : "·"}</span>
+      <input type="checkbox" class="plr-check" ${checked ? "checked" : ""}>
+      <span class="plr-cat-dot" style="background:${cat.color || "#6366f1"}"></span>
+      <span class="plr-cat-name">${cat.name}</span>
+      <span class="plr-cat-n">${subtreeCount}</span>
+    `;
+
+    // Toggle expand arrow
+    row.querySelector(".plr-toggle").addEventListener("click", (e) => {
+      e.preventDefault();
+      if (!hasChildren) return;
+      if (expanded) this.rs.expandedCategories.delete(cat.id);
+      else this.rs.expandedCategories.add(cat.id);
+      this.render();
+    });
+
+    // Checkbox
+    row.querySelector(".plr-check").addEventListener("change", (e) => {
+      if (e.target.checked) this.rs.selectedCategoryIds.add(cat.id);
+      else this.rs.selectedCategoryIds.delete(cat.id);
+      this._flushToWidget();
+      this.render();
+    });
+
+    wrap.appendChild(row);
+
+    if (hasChildren && expanded) {
+      const sub = document.createElement("div");
+      children.forEach((c) => sub.appendChild(this._buildCatRow(c, depth + 1)));
+      wrap.appendChild(sub);
+    }
+    return wrap;
+  }
+
+  // ── Pool preview ─────────────────────────────────────────────────
+  _buildPool() {
+    const wrap = document.createElement("div");
+    wrap.className = "plr-pool-wrap";
+
+    const pool = this._getPool();
+
+    const title = document.createElement("div");
+    title.className = "plr-section-title";
+    title.innerHTML = `<span>Prompt pool</span>
+      <span class="plr-badge ${pool.length === 0 ? "plr-badge-warn" : ""}">${pool.length} eligible</span>`;
+    wrap.appendChild(title);
+
+    if (pool.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "plr-empty";
+      empty.innerHTML = `<span>No categories selected — nothing to randomize.</span>`;
+      wrap.appendChild(empty);
+      return wrap;
+    }
+
+    const list = document.createElement("div");
+    list.className = "plr-pool-list";
+    pool.forEach((p) => {
+      const cat = state.categories.find((c) => c.id === p.category_id);
+      const item = document.createElement("div");
+      item.className = "plr-pool-item";
+      item.innerHTML = `
+        <span class="plr-pool-dot" style="background:${cat?.color || "#888"}"></span>
+        <span class="plr-pool-title">${p.title}</span>
+        ${cat ? `<span class="plr-pool-cat">${cat.name}</span>` : ""}
+      `;
+      list.appendChild(item);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
 //  Register the ComfyUI extension
 // ──────────────────────────────────────────────────────────────────
 app.registerExtension({
   name: "PromptLibrary",
 
   async beforeRegisterNodeDef(nodeType, nodeData, app) {
-    if (nodeData.name !== "PromptLibraryNode") return;
 
-    const onNodeCreated = nodeType.prototype.onNodeCreated;
-    nodeType.prototype.onNodeCreated = function () {
-      onNodeCreated?.apply(this, arguments);
+    // ── Existing browse node ───────────────────────────────────────
+    if (nodeData.name === "PromptLibraryNode") {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        onNodeCreated?.apply(this, arguments);
 
-      this.size = [540, 640];
-      this.resizable = true;
+        this.size = [540, 640];
+        this.resizable = true;
 
-      // Create a wrapper div that will be strictly sized by ComfyUI
-      const el = document.createElement("div");
-      el.className = "pl-container";
-      // Force the element to never overflow its allocated widget space
-      el.style.cssText = [
-        "width:100%",
-        "height:100%",
-        "overflow:hidden",
-        "display:flex",
-        "flex-direction:column",
-        "box-sizing:border-box",
-      ].join(";");
+        const el = document.createElement("div");
+        el.className = "pl-container";
+        el.style.cssText = [
+          "width:100%", "height:100%", "overflow:hidden",
+          "display:flex", "flex-direction:column", "box-sizing:border-box",
+        ].join(";");
 
-      const domWidget = this.addDOMWidget("library_ui", "customtext", el, {
-        getValue: () => "",
-        setValue: () => {},
-        // Tell ComfyUI this widget should consume all remaining vertical space
-        computeSize: (width) => {
-          // Total node height minus the space taken by the other widgets
-          // (prompt_id + prefix + suffix inputs each ~80px, header ~50px)
-          const otherWidgetsH = 50 + 80 + 80 + 80; // title bar + 3 inputs
-          const minH = 340;
-          const desired = (this.size?.[1] ?? 640) - otherWidgetsH;
-          return [width, Math.max(minH, desired)];
-        },
-      });
+        const domWidget = this.addDOMWidget("library_ui", "customtext", el, {
+          getValue: () => "",
+          setValue: () => {},
+          computeSize: (width) => {
+            const otherWidgetsH = 50 + 80 + 80 + 80;
+            const minH = 340;
+            const desired = (this.size?.[1] ?? 640) - otherWidgetsH;
+            return [width, Math.max(minH, desired)];
+          },
+        });
 
-      // Keep el height in sync whenever the node is resized
-      const syncHeight = () => {
-        const otherWidgetsH = 50 + 80 + 80 + 80;
-        const h = Math.max(340, (this.size?.[1] ?? 640) - otherWidgetsH);
-        el.style.height = h + "px";
-        el.style.maxHeight = h + "px";
-      };
-
-      const origOnResize = this.onResize;
-      this.onResize = function (size) {
-        origOnResize?.call(this, size);
+        const syncHeight = () => {
+          const otherWidgetsH = 50 + 80 + 80 + 80;
+          const h = Math.max(340, (this.size?.[1] ?? 640) - otherWidgetsH);
+          el.style.height = h + "px";
+          el.style.maxHeight = h + "px";
+        };
+        const origOnResize = this.onResize;
+        this.onResize = function (size) {
+          origOnResize?.call(this, size);
+          syncHeight();
+        };
         syncHeight();
-      };
-      syncHeight();
 
-      const panel = new PromptLibraryPanel(this);
-      panel.container = el;
-      panel.init();
-    };
+        const panel = new PromptLibraryPanel(this);
+        panel.container = el;
+        panel.init();
+      };
+    }
+
+    // ── New random node ────────────────────────────────────────────
+    if (nodeData.name === "PromptLibraryRandomNode") {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        onNodeCreated?.apply(this, arguments);
+
+        this.size = [460, 560];
+        this.resizable = true;
+
+        const el = document.createElement("div");
+        el.className = "pl-container";
+        el.style.cssText = [
+          "width:100%", "height:100%", "overflow:hidden",
+          "display:flex", "flex-direction:column", "box-sizing:border-box",
+        ].join(";");
+
+        // category_ids and seed widgets are already created by ComfyUI
+        // from INPUT_TYPES — estimate their combined height
+        const otherWidgetsH = () => {
+          const wCount = (this.widgets?.length ?? 4);
+          // Each standard single-line widget ≈ 38px, node title ≈ 36px
+          return 36 + (wCount - 1) * 38; // -1 for the DOM widget itself
+        };
+
+        this.addDOMWidget("random_ui", "customtext", el, {
+          getValue: () => "",
+          setValue: () => {},
+          computeSize: (width) => {
+            const minH = 300;
+            const desired = (this.size?.[1] ?? 560) - otherWidgetsH();
+            return [width, Math.max(minH, desired)];
+          },
+        });
+
+        const syncHeight = () => {
+          const h = Math.max(300, (this.size?.[1] ?? 560) - otherWidgetsH());
+          el.style.height = h + "px";
+          el.style.maxHeight = h + "px";
+        };
+        const origOnResize = this.onResize;
+        this.onResize = function (size) {
+          origOnResize?.call(this, size);
+          syncHeight();
+        };
+        syncHeight();
+
+        const panel = new PromptLibraryRandomPanel(this);
+        panel.container = el;
+        panel.init();
+      };
+    }
   },
 });
