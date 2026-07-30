@@ -20,11 +20,13 @@ Includes a dedicated **Random Prompt** node for automatic prompt variation on ev
 | 🏷️ **Tags** | Comma-separated tags on every prompt |
 | ➖ **Negative prompts** | Store positive + negative together |
 | ↗ **One-click use** | Instantly loads the selected prompt into the node |
+| 🧹 **Clear selection** | Deselect all prompts from the manual node without deleting library data |
+| ↕ **Import / Export** | Replace the library from a local JSON file or download a backup |
 | ✎ **Edit in place** | Modal editors for prompts and categories |
 | 🎲 **Random mode** | Separate node that picks a random prompt from selected categories at every run |
 | 🌱 **Seed control** | Fixed seed for reproducible results, `-1` for true randomness |
 | 🔀 **Random segments** | Support for `{abc|xyz|123}` syntax (supports nesting) |
-| 💾 **Auto-persist** | All data saved to `prompt_library_data.json` |
+| 💾 **Auto-persist** | All data saved to `prompt_library_data.json` in the ComfyUI user directory |
 
 ---
 
@@ -59,6 +61,10 @@ git clone https://github.com/NoudH/ComfyUI-Prompt-Library
 ## 📚 Node 1 — Prompt Library (manual)
 
 Browse your library, search, manage categories, and load any prompt with one click.
+
+The panel header provides **Import** and **Export** controls. Import reads a local JSON file and, after confirmation, replaces the complete shared library. Invalid files are rejected without changing the current data. Export downloads the latest persisted library as `prompt_library_data.json`. Exporting a backup is recommended before importing.
+
+Use **Clear selection** above the prompt grid to clear the current node's `prompt_ids` and `prompts` values without deleting any saved prompts or changing the Random Prompt node's category selection.
 
 ### Outputs
 
@@ -113,8 +119,22 @@ The selection is stored in the `category_ids` widget and persists with the saved
 
 ## 📂 Data file
 
-All prompts and categories are stored in `prompt_library_data.json` in the node folder.
-You can back it up, version-control it, or share it between machines.
+All prompts and categories are stored as `prompt_library_data.json` in the configured ComfyUI user directory returned by `folder_paths.get_user_directory()`. This location follows ComfyUI's `--user-directory` setting and keeps library data outside the custom node installation.
+
+On first use after upgrading, an existing `prompt_library_data.json` in the custom node folder is copied automatically when no file exists at the new location. The original file is retained as a backup.
+
+You can back up, version-control, or share the user-directory data file between machines.
+
+Import and export use the same JSON root structure:
+
+```json
+{
+  "categories": [],
+  "prompts": []
+}
+```
+
+Import validates IDs, category relationships, prompt fields, tags, and colors before atomically replacing the data file.
 
 ---
 
@@ -134,6 +154,12 @@ You can back it up, version-control it, or share it between machines.
 ---
 
 ## 📝 Changelog
+
+### Next release
+- Moved prompt library storage to the configured ComfyUI user directory, with automatic migration from the legacy node-local file
+- Added JSON import with confirmation, schema validation, and atomic persistence
+- Added JSON export for downloading the latest persisted library
+- Added a clear-selection control for the manual Prompt Library node
 
 ### v1.3
 - 🎲 Added **Prompt Library Random** node (`PromptLibraryRandomNode`)
