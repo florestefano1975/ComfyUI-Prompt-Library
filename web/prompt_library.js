@@ -4,53 +4,72 @@ import { $el } from "../../scripts/ui.js";
 // ──────────────────────────────────────────────────────────────────
 //  API helpers
 // ──────────────────────────────────────────────────────────────────
+async function parseApiResponse(response) {
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    // A non-JSON error response is handled by the generic message below.
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || `Request failed with status ${response.status}.`);
+  }
+  return payload;
+}
+
 const API = {
   async get() {
-    const r = await fetch("/prompt_library/data");
-    return r.json();
+    return parseApiResponse(await fetch("/prompt_library/data"));
   },
   async save(data) {
-    await fetch("/prompt_library/data", {
+    const response = await fetch("/prompt_library/data", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     });
+    return parseApiResponse(response);
   },
   async addCategory(body) {
-    const r = await fetch("/prompt_library/category", {
+    const response = await fetch("/prompt_library/category", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    return r.json();
+    return parseApiResponse(response);
   },
   async updateCategory(id, body) {
-    await fetch(`/prompt_library/category/${id}`, {
+    const response = await fetch(`/prompt_library/category/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    await parseApiResponse(response);
   },
   async deleteCategory(id) {
-    await fetch(`/prompt_library/category/${id}`, { method: "DELETE" });
+    await parseApiResponse(
+      await fetch(`/prompt_library/category/${id}`, { method: "DELETE" })
+    );
   },
   async addPrompt(body) {
-    const r = await fetch("/prompt_library/prompt", {
+    const response = await fetch("/prompt_library/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    return r.json();
+    return parseApiResponse(response);
   },
   async updatePrompt(id, body) {
-    await fetch(`/prompt_library/prompt/${id}`, {
+    const response = await fetch(`/prompt_library/prompt/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    await parseApiResponse(response);
   },
   async deletePrompt(id) {
-    await fetch(`/prompt_library/prompt/${id}`, { method: "DELETE" });
+    await parseApiResponse(
+      await fetch(`/prompt_library/prompt/${id}`, { method: "DELETE" })
+    );
   },
 };
 
@@ -61,6 +80,7 @@ let state = {
   categories: [],
   prompts: [],
   selectedCategoryId: null,
+  selectedPromptIds: [],
   expandedCategories: new Set(),
   searchQuery: "",
   editingPrompt: null,
@@ -122,6 +142,28 @@ function filteredPrompts() {
   return list;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function safeColor(value, fallback = "#6366f1") {
+  return /^#[0-9a-fA-F]{6}$/.test(value || "") ? value : fallback;
+}
+
+function checkImportedLibraryShape(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("The library root must be a JSON object.");
+  }
+  if (!Array.isArray(data.categories) || !Array.isArray(data.prompts)) {
+    throw new Error("The library must contain categories and prompts arrays.");
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────
 //  Modal dialog
 // ──────────────────────────────────────────────────────────────────
@@ -145,6 +187,7 @@ function showModal(content, onClose) {
 //  Main panel renderer
 // ──────────────────────────────────────────────────────────────────
 class PromptLibraryPanel {
+
   constructor(node) {
     this.node = node;
     this.container = null;
@@ -154,6 +197,16 @@ class PromptLibraryPanel {
     const data = await API.get();
     state.categories = data.categories || [];
     state.prompts = data.prompts || [];
+
+    // Sync from node if it already contains a saved workflow selection.
+    if (this.node) {
+      const widget = this.node.widgets?.find((item) => item.name === "prompt_ids");
+      const selectedIds = widget?.value
+        ? widget.value.split(",").map((id) => id.trim()).filter(Boolean)
+        : [];
+      this.syncPromptSelection(selectedIds, false);
+    }
+
     this.render();
   }
 
@@ -232,18 +285,111 @@ class PromptLibraryPanel {
         <span>Prompt Library</span>
       </div>
       <div class="pl-header-actions">
-        <input class="pl-search" placeholder="🔍  Search prompts…" value="${state.searchQuery}">
+        <input class="pl-search" placeholder="🔍  Search prompts…" value="${escapeHtml(state.searchQuery)}">
+        <button class="pl-btn pl-btn-compact" id="pl-import" title="Replace the library from a JSON file">Import</button>
+        <button class="pl-btn pl-btn-compact" id="pl-export" title="Download the current library as JSON">Export</button>
         <button class="pl-btn pl-btn-accent" id="pl-new-prompt">＋ New Prompt</button>
+        <input class="pl-file-input" id="pl-import-file" type="file" accept=".json,application/json">
       </div>
     `;
-    header.querySelector(".pl-search").addEventListener("input", (e) => {
-      state.searchQuery = e.target.value;
+    header.querySelector(".pl-search").addEventListener("input", (event) => {
+      state.searchQuery = event.target.value;
       this.render();
     });
     header.querySelector("#pl-new-prompt").addEventListener("click", () => {
       this.openPromptEditor(null);
     });
+
+    const fileInput = header.querySelector("#pl-import-file");
+    header.querySelector("#pl-import").addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      event.target.value = "";
+      if (file) await this.prepareImport(file);
+    });
+    header.querySelector("#pl-export").addEventListener("click", (event) => {
+      this.exportLibrary(event.currentTarget);
+    });
     return header;
+  }
+
+  async prepareImport(file) {
+    let importedData;
+    try {
+      importedData = JSON.parse(await file.text());
+      checkImportedLibraryShape(importedData);
+    } catch (error) {
+      const message = error instanceof SyntaxError ? "The selected file is not valid JSON." : error.message;
+      this.showToast(`Import failed: ${message}`);
+      return;
+    }
+
+    const content = `
+      <div class="pl-modal-header"><h2>Import Prompt Library</h2><button class="pl-modal-close" id="mclose">✕</button></div>
+      <div class="pl-form">
+        <p>Replace the complete current library with <strong>${importedData.categories.length}</strong> categories and <strong>${importedData.prompts.length}</strong> prompts?</p>
+        <p class="pl-warn">⚠ Existing categories and prompts will be replaced. Export a backup first if needed.</p>
+        <div class="pl-form-actions">
+          <button class="pl-btn" id="f-cancel">Cancel</button>
+          <button class="pl-btn pl-btn-accent" id="f-confirm">Import and Replace</button>
+        </div>
+      </div>
+    `;
+    const { modal, close } = showModal(content);
+    modal.querySelector("#mclose").addEventListener("click", close);
+    modal.querySelector("#f-cancel").addEventListener("click", close);
+    modal.querySelector("#f-confirm").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = "Importing…";
+      try {
+        const response = await API.save(importedData);
+        const acceptedData = response?.data || importedData;
+        state.categories = acceptedData.categories;
+        state.prompts = acceptedData.prompts;
+        state.selectedCategoryId = null;
+        state.expandedCategories = new Set();
+        state.searchQuery = "";
+        const searchInput = this.container?.querySelector(".pl-search");
+        if (searchInput) searchInput.value = "";
+        this.syncPromptSelection(state.selectedPromptIds);
+        close();
+        this.render();
+        this.showToast(
+          `Imported ${state.categories.length} categories and ${state.prompts.length} prompts.`
+        );
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "Import and Replace";
+        this.showToast(`Import failed: ${error.message}`);
+      }
+    });
+  }
+
+  async exportLibrary(button) {
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = "Exporting…";
+    try {
+      const data = await API.get();
+      const json = `${JSON.stringify(data, null, 2)}\n`;
+      const blob = new Blob([json], { type: "application/json;charset=utf-8" });
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = "prompt_library_data.json";
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+      this.showToast("Prompt library exported.");
+    } catch (error) {
+      this.showToast(`Export failed: ${error.message}`);
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
   }
 
   // ── Sidebar (categories tree) ────────────────────────────────────
@@ -300,8 +446,8 @@ class PromptLibraryPanel {
 
     row.innerHTML = `
       <span class="pl-cat-toggle">${hasChildren ? (expanded ? "▾" : "▸") : "·"}</span>
-      <span class="pl-cat-dot" style="background:${cat.color || "#6366f1"}"></span>
-      <span class="pl-cat-label">${cat.name}</span>
+      <span class="pl-cat-dot" style="background:${safeColor(cat.color)}"></span>
+      <span class="pl-cat-label">${escapeHtml(cat.name)}</span>
       <span class="pl-cat-count">${count}</span>
       <span class="pl-cat-actions">
         <button class="pl-icon-btn" title="Add sub-category" data-action="add-sub">＋</button>
@@ -363,9 +509,21 @@ class PromptLibraryPanel {
         ? state.categories.find((c) => c.id === state.selectedCategoryId)?.name || "Unknown"
         : "All Prompts";
 
+    const selectedCount = state.selectedPromptIds.length;
     const bar = document.createElement("div");
     bar.className = "pl-content-bar";
-    bar.innerHTML = `<h3 class="pl-content-title">${catName} <span class="pl-count-badge">${prompts.length}</span></h3>`;
+    bar.innerHTML = `
+      <h3 class="pl-content-title">${escapeHtml(catName)} <span class="pl-count-badge">${prompts.length}</span></h3>
+      <div class="pl-selection-actions">
+        <span class="pl-selection-count">${selectedCount} selected</span>
+        <button class="pl-btn pl-btn-compact" id="pl-clear-selection" ${selectedCount ? "" : "disabled"}>Clear selection</button>
+      </div>
+    `;
+    bar.querySelector("#pl-clear-selection").addEventListener("click", () => {
+      this.syncPromptSelection([]);
+      this.render();
+      this.showToast("Prompt selection cleared.");
+    });
     content.appendChild(bar);
 
     if (prompts.length === 0) {
@@ -394,31 +552,35 @@ class PromptLibraryPanel {
 
   buildPromptCard(prompt) {
     const cat = state.categories.find((c) => c.id === prompt.category_id);
+    const categoryColor = safeColor(cat?.color);
+    const isSelected = state.selectedPromptIds.includes(prompt.id);
     const card = document.createElement("div");
-    card.className = "pl-card";
+    card.className = "pl-card" + (isSelected ? " selected" : "");
     card.innerHTML = `
       <div class="pl-card-header">
-        <span class="pl-card-title">${prompt.title}</span>
+        <span class="pl-card-title">${escapeHtml(prompt.title)}</span>
         <div class="pl-card-header-actions">
-          <button class="pl-icon-btn" title="Use this prompt" data-action="use">↗</button>
           <button class="pl-icon-btn" title="Edit" data-action="edit">✎</button>
           <button class="pl-icon-btn pl-icon-btn-danger" title="Delete" data-action="delete">✕</button>
         </div>
       </div>
-      ${cat ? `<div class="pl-card-cat" style="background:${cat.color}22;color:${cat.color}">
-        <span class="pl-card-dot" style="background:${cat.color}"></span>${cat.name}</div>` : ""}
-      <p class="pl-card-text">${prompt.text}</p>
-      ${prompt.negative ? `<p class="pl-card-neg"><span>neg:</span> ${prompt.negative}</p>` : ""}
+      ${cat ? `<div class="pl-card-cat" style="background:${categoryColor}22;color:${categoryColor}">
+        <span class="pl-card-dot" style="background:${categoryColor}"></span>${escapeHtml(cat.name)}</div>` : ""}
+      <p class="pl-card-text">${escapeHtml(prompt.text)}</p>
+      ${prompt.negative ? `<p class="pl-card-neg"><span>neg:</span> ${escapeHtml(prompt.negative)}</p>` : ""}
       ${
         prompt.tags?.length
-          ? `<div class="pl-card-tags">${prompt.tags.map((t) => `<span class="pl-tag">${t}</span>`).join("")}</div>`
+          ? `<div class="pl-card-tags">${prompt.tags.map((tag) => `<span class="pl-tag">${escapeHtml(tag)}</span>`).join("")}</div>`
           : ""
       }
+      <input type="checkbox" style="display:none" ${isSelected ? "checked" : ""}>
     `;
 
-    card.querySelector("[data-action='use']").addEventListener("click", () => {
-      this.usePrompt(prompt);
+    card.addEventListener("click", (e) => {
+      if (e.target.closest(".pl-card-header-actions")) return;
+      this.togglePrompt(prompt);
     });
+
     card.querySelector("[data-action='edit']").addEventListener("click", () => {
       this.openPromptEditor(prompt);
     });
@@ -429,18 +591,38 @@ class PromptLibraryPanel {
     return card;
   }
 
-  // ── Use prompt (set node widget value) ───────────────────────────
-  usePrompt(prompt) {
+  // ── Prompt selection ────────────────────────────────────────────
+  syncPromptSelection(selectedIds, markDirty = true) {
+    const validPromptIds = new Set(state.prompts.map((prompt) => prompt.id));
+    state.selectedPromptIds = [...new Set(selectedIds)].filter((id) => validPromptIds.has(id));
+
     if (this.node) {
-      // Find the prompt_id widget and set it
-      const w = this.node.widgets?.find((w) => w.name === "prompt_id");
-      if (w) {
-        w.value = prompt.id;
-        this.node.setDirtyCanvas(true);
+      const idsWidget = this.node.widgets?.find((widget) => widget.name === "prompt_ids");
+      if (idsWidget) idsWidget.value = state.selectedPromptIds.join(",");
+
+      const titlesWidget = this.node.widgets?.find((widget) => widget.name === "prompts");
+      if (titlesWidget) {
+        titlesWidget.value = state.selectedPromptIds
+          .map((id) => state.prompts.find((prompt) => prompt.id === id)?.title || id)
+          .join(", ");
       }
+      if (markDirty) this.node.setDirtyCanvas?.(true);
     }
-    // Flash feedback
-    this.showToast(`✓ Loaded: ${prompt.title}`);
+  }
+
+  togglePrompt(prompt) {
+    const selectedIds = [...state.selectedPromptIds];
+    const index = selectedIds.indexOf(prompt.id);
+    if (index === -1) {
+      selectedIds.push(prompt.id);
+      this.showToast(`✓ Selected: ${prompt.title}`);
+    } else {
+      selectedIds.splice(index, 1);
+      this.showToast(`✕ Unselected: ${prompt.title}`);
+    }
+
+    this.syncPromptSelection(selectedIds);
+    this.render();
   }
 
   showToast(msg) {
@@ -462,7 +644,7 @@ class PromptLibraryPanel {
     const catOptions = state.categories
       .map(
         (c) =>
-          `<option value="${c.id}" ${existing?.category_id === c.id ? "selected" : ""}>${c.name}</option>`
+          `<option value="${escapeHtml(c.id)}" ${existing?.category_id === c.id ? "selected" : ""}>${escapeHtml(c.name)}</option>`
       )
       .join("");
 
@@ -470,7 +652,7 @@ class PromptLibraryPanel {
       <div class="pl-modal-header"><h2>${title}</h2><button class="pl-modal-close" id="mclose">✕</button></div>
       <div class="pl-form">
         <label>Title *</label>
-        <input id="f-title" class="pl-input" value="${existing?.title || ""}">
+        <input id="f-title" class="pl-input" value="${escapeHtml(existing?.title)}">
         
         <label>Category</label>
         <select id="f-cat" class="pl-input">
@@ -479,13 +661,13 @@ class PromptLibraryPanel {
         </select>
         
         <label>Positive Prompt *</label>
-        <textarea id="f-text" class="pl-textarea" rows="6">${existing?.text || ""}</textarea>
+        <textarea id="f-text" class="pl-textarea" rows="6">${escapeHtml(existing?.text)}</textarea>
         
         <label>Negative Prompt</label>
-        <textarea id="f-neg" class="pl-textarea" rows="3">${existing?.negative || ""}</textarea>
+        <textarea id="f-neg" class="pl-textarea" rows="3">${escapeHtml(existing?.negative)}</textarea>
         
         <label>Tags <span style="opacity:.5;font-size:11px">(comma separated)</span></label>
-        <input id="f-tags" class="pl-input" value="${(existing?.tags || []).join(", ")}">
+        <input id="f-tags" class="pl-input" value="${escapeHtml((existing?.tags || []).join(", "))}">
         
         <div class="pl-form-actions">
           <button class="pl-btn" id="f-cancel">Cancel</button>
@@ -517,12 +699,13 @@ class PromptLibraryPanel {
           .filter(Boolean),
       };
       if (isNew) {
-        const p = await API.addPrompt(body);
-        state.prompts.push(p);
+        const prompt = await API.addPrompt(body);
+        state.prompts.push(prompt);
       } else {
         await API.updatePrompt(existing.id, body);
         Object.assign(existing, body);
       }
+      this.syncPromptSelection(state.selectedPromptIds);
       close();
       this.render();
     });
@@ -532,7 +715,7 @@ class PromptLibraryPanel {
   openCategoryEditor(existing, parentId) {
     const isNew = !existing;
     const colors = ["#6366f1","#ec4899","#f59e0b","#10b981","#3b82f6","#ef4444","#8b5cf6","#14b8a6"];
-    const selectedColor = existing?.color || colors[0];
+    const selectedColor = safeColor(existing?.color, colors[0]);
 
     const content = `
       <div class="pl-modal-header">
@@ -541,7 +724,7 @@ class PromptLibraryPanel {
       </div>
       <div class="pl-form">
         <label>Name *</label>
-        <input id="f-catname" class="pl-input" value="${existing?.name || ""}">
+        <input id="f-catname" class="pl-input" value="${escapeHtml(existing?.name)}">
         
         <label>Color</label>
         <div class="pl-color-picker" id="f-colorpicker">
@@ -598,7 +781,7 @@ class PromptLibraryPanel {
     const content = `
       <div class="pl-modal-header"><h2>Delete Category</h2><button class="pl-modal-close" id="mclose">✕</button></div>
       <div class="pl-form">
-        <p>Delete <strong>${cat.name}</strong>?</p>
+        <p>Delete <strong>${escapeHtml(cat.name)}</strong>?</p>
         ${subs ? `<p class="pl-warn">⚠ This will also delete <strong>${subs}</strong> sub-categor${subs > 1 ? "ies" : "y"}.</p>` : ""}
         ${prompts ? `<p class="pl-warn">⚠ This will also delete <strong>${prompts}</strong> prompt${prompts > 1 ? "s" : ""}.</p>` : ""}
         <div class="pl-form-actions">
@@ -616,6 +799,7 @@ class PromptLibraryPanel {
       state.categories = state.categories.filter((c) => !ids.includes(c.id));
       state.prompts = state.prompts.filter((p) => !ids.includes(p.category_id));
       if (ids.includes(state.selectedCategoryId)) state.selectedCategoryId = null;
+      this.syncPromptSelection(state.selectedPromptIds);
       close();
       this.render();
     });
@@ -625,7 +809,7 @@ class PromptLibraryPanel {
     const content = `
       <div class="pl-modal-header"><h2>Delete Prompt</h2><button class="pl-modal-close" id="mclose">✕</button></div>
       <div class="pl-form">
-        <p>Delete <strong>${prompt.title}</strong>?</p>
+        <p>Delete <strong>${escapeHtml(prompt.title)}</strong>?</p>
         <div class="pl-form-actions">
           <button class="pl-btn" id="f-cancel">Cancel</button>
           <button class="pl-btn pl-btn-danger" id="f-confirm">Delete</button>
@@ -637,7 +821,8 @@ class PromptLibraryPanel {
     modal.querySelector("#f-cancel").addEventListener("click", close);
     modal.querySelector("#f-confirm").addEventListener("click", async () => {
       await API.deletePrompt(prompt.id);
-      state.prompts = state.prompts.filter((p) => p.id !== prompt.id);
+      state.prompts = state.prompts.filter((item) => item.id !== prompt.id);
+      this.syncPromptSelection(state.selectedPromptIds);
       close();
       this.render();
     });
@@ -800,8 +985,8 @@ class PromptLibraryRandomPanel {
     row.innerHTML = `
       <span class="plr-toggle">${hasChildren ? (expanded ? "▾" : "▸") : "·"}</span>
       <input type="checkbox" class="plr-check" ${checked ? "checked" : ""}>
-      <span class="plr-cat-dot" style="background:${cat.color || "#6366f1"}"></span>
-      <span class="plr-cat-name">${cat.name}</span>
+      <span class="plr-cat-dot" style="background:${safeColor(cat.color)}"></span>
+      <span class="plr-cat-name">${escapeHtml(cat.name)}</span>
       <span class="plr-cat-n">${subtreeCount}</span>
     `;
 
@@ -860,9 +1045,9 @@ class PromptLibraryRandomPanel {
       const item = document.createElement("div");
       item.className = "plr-pool-item";
       item.innerHTML = `
-        <span class="plr-pool-dot" style="background:${cat?.color || "#888"}"></span>
-        <span class="plr-pool-title">${p.title}</span>
-        ${cat ? `<span class="plr-pool-cat">${cat.name}</span>` : ""}
+        <span class="plr-pool-dot" style="background:${safeColor(cat?.color, "#888888")}"></span>
+        <span class="plr-pool-title">${escapeHtml(p.title)}</span>
+        ${cat ? `<span class="plr-pool-cat">${escapeHtml(cat.name)}</span>` : ""}
       `;
       list.appendChild(item);
     });
@@ -974,6 +1159,71 @@ app.registerExtension({
         const panel = new PromptLibraryRandomPanel(this);
         panel.container = el;
         panel.init();
+      };
+    }
+
+    // ── String concatenate node ────────────────────────────────────
+    if (nodeData.name === "StringConcatenateNode") {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        onNodeCreated?.apply(this, arguments);
+
+        const inputCountWidget = this.widgets.find((w) => w.name === "input_count");
+        const delimiterWidget = this.widgets.find((w) => w.name === "delimiter");
+        const resultWidget = this.widgets.find((w) => w.name === "result");
+
+        if (resultWidget) {
+          resultWidget.inputEl.readOnly = true;
+          resultWidget.inputEl.style.opacity = 0.7;
+        }
+
+        const syncInputs = (count) => {
+          if (!this.inputs) this.inputs = [];
+
+          // Add inputs up to count
+          for (let i = 1; i <= count; i++) {
+            const name = `string${i}`;
+            if (this.findInputSlot(name) === -1) {
+              this.addInput(name, "STRING");
+            }
+          }
+
+          // Remove inputs beyond count
+          for (let i = this.inputs.length - 1; i >= 0; i--) {
+            const name = this.inputs[i].name;
+            if (name.startsWith("string")) {
+              const num = parseInt(name.replace("string", ""));
+              if (num > count || isNaN(num)) {
+                this.removeInput(i);
+              }
+            }
+          }
+
+          this.setDirtyCanvas(true);
+        };
+
+        if (inputCountWidget) {
+          const self = this;
+          const origCallback = inputCountWidget.callback;
+          inputCountWidget.callback = function (v) {
+            const res = origCallback?.apply(this, arguments);
+            syncInputs(v);
+            return res;
+          };
+        }
+
+        if (delimiterWidget) {
+          const origCallback = delimiterWidget.callback;
+          delimiterWidget.callback = function (v) {
+            const res = origCallback?.apply(this, arguments);
+            return res;
+          };
+        }
+
+        // Initial sync
+        setTimeout(() => {
+          if (inputCountWidget) syncInputs(inputCountWidget.value);
+        }, 0);
       };
     }
   },
