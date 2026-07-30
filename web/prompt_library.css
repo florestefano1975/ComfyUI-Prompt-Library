@@ -79,9 +79,11 @@
 .pl-header-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex: 1;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  min-width: 0;
 }
 
 .pl-search {
@@ -92,7 +94,9 @@
   font-family: var(--pl-font);
   font-size: 12px;
   padding: 5px 12px;
-  width: 180px;
+  width: 150px;
+  min-width: 120px;
+  flex: 1 1 150px;
   outline: none;
   transition: border-color var(--pl-transition), box-shadow var(--pl-transition);
 }
@@ -116,6 +120,16 @@
   white-space: nowrap;
 }
 .pl-btn:hover { background: #252a3a; border-color: #3d4460; }
+.pl-btn:disabled {
+  cursor: default;
+  opacity: .45;
+  pointer-events: none;
+}
+.pl-btn-compact {
+  font-size: 10px;
+  padding: 5px 8px;
+}
+.pl-file-input { display: none; }
 
 .pl-btn-accent {
   background: var(--pl-accent);
@@ -262,6 +276,18 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+.pl-selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+.pl-selection-count {
+  color: var(--pl-text-muted);
+  font-size: 10px;
+  white-space: nowrap;
 }
 .pl-count-badge {
   background: var(--pl-surface2);

@@ -3,29 +3,194 @@ import os
 import uuid
 import re
 import random
+import stat
+import tempfile
 from datetime import datetime
 from aiohttp import web
+import folder_paths
 from server import PromptServer
 
-# Path to store the prompt library data
-LIBRARY_FILE = os.path.join(os.path.dirname(__file__), "prompt_library_data.json")
+LIBRARY_FILENAME = "prompt_library_data.json"
+LEGACY_LIBRARY_FILE = os.path.join(os.path.dirname(__file__), LIBRARY_FILENAME)
+LIBRARY_FILE = os.path.join(folder_paths.get_user_directory(), LIBRARY_FILENAME)
+
+
+class LibraryValidationError(ValueError):
+    """Raised when replacement library data does not match the expected schema."""
+
+
+def validate_library(data):
+    """Validate and normalize a complete prompt library."""
+    if not isinstance(data, dict):
+        raise LibraryValidationError("The library root must be a JSON object.")
+
+    categories = data.get("categories")
+    prompts = data.get("prompts")
+    if not isinstance(categories, list) or not isinstance(prompts, list):
+        raise LibraryValidationError("The library must contain categories and prompts arrays.")
+
+    category_ids = set()
+    parent_by_id = {}
+    for index, category in enumerate(categories):
+        label = f"Category at index {index}"
+        if not isinstance(category, dict):
+            raise LibraryValidationError(f"{label} must be an object.")
+
+        category_id = category.get("id")
+        if (
+            not isinstance(category_id, str)
+            or not category_id.strip()
+            or category_id != category_id.strip()
+            or "," in category_id
+        ):
+            raise LibraryValidationError(
+                f"{label} must have a non-empty string id without commas or outer whitespace."
+            )
+        if category_id in category_ids:
+            raise LibraryValidationError(f"Duplicate category id: {category_id}")
+        category_ids.add(category_id)
+
+        name = category.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise LibraryValidationError(f"{label} must have a non-empty string name.")
+
+        parent_id = category.get("parent_id")
+        if parent_id is not None and (not isinstance(parent_id, str) or not parent_id.strip()):
+            raise LibraryValidationError(f"{label} has an invalid parent_id.")
+        parent_by_id[category_id] = parent_id
+
+        color = category.get("color", "#6366f1")
+        if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            raise LibraryValidationError(f"{label} has an invalid color; use a six-digit hex color.")
+        category.setdefault("parent_id", None)
+        category.setdefault("color", "#6366f1")
+
+        created_at = category.get("created_at")
+        if created_at is not None and not isinstance(created_at, str):
+            raise LibraryValidationError(f"{label} has an invalid created_at value.")
+
+    for category_id, parent_id in parent_by_id.items():
+        if parent_id is not None and parent_id not in category_ids:
+            raise LibraryValidationError(
+                f"Category {category_id} references an unknown parent category."
+            )
+        if parent_id == category_id:
+            raise LibraryValidationError(f"Category {category_id} cannot be its own parent.")
+
+        visited = {category_id}
+        current_id = parent_id
+        while current_id is not None:
+            if current_id in visited:
+                raise LibraryValidationError("Category parent references contain a cycle.")
+            visited.add(current_id)
+            current_id = parent_by_id.get(current_id)
+
+    prompt_ids = set()
+    for index, prompt in enumerate(prompts):
+        label = f"Prompt at index {index}"
+        if not isinstance(prompt, dict):
+            raise LibraryValidationError(f"{label} must be an object.")
+
+        prompt_id = prompt.get("id")
+        if (
+            not isinstance(prompt_id, str)
+            or not prompt_id.strip()
+            or prompt_id != prompt_id.strip()
+            or "," in prompt_id
+        ):
+            raise LibraryValidationError(
+                f"{label} must have a non-empty string id without commas or outer whitespace."
+            )
+        if prompt_id in prompt_ids:
+            raise LibraryValidationError(f"Duplicate prompt id: {prompt_id}")
+        prompt_ids.add(prompt_id)
+
+        title = prompt.get("title")
+        text = prompt.get("text")
+        if not isinstance(title, str) or not title.strip():
+            raise LibraryValidationError(f"{label} must have a non-empty string title.")
+        if not isinstance(text, str) or not text.strip():
+            raise LibraryValidationError(f"{label} must have non-empty string text.")
+
+        category_id = prompt.get("category_id")
+        if category_id is not None and (
+            not isinstance(category_id, str) or not category_id.strip()
+        ):
+            raise LibraryValidationError(f"{label} has an invalid category_id.")
+        if category_id is not None and category_id not in category_ids:
+            raise LibraryValidationError(f"{label} references an unknown category.")
+
+        negative = prompt.get("negative", "")
+        if not isinstance(negative, str):
+            raise LibraryValidationError(f"{label} has an invalid negative prompt.")
+
+        tags = prompt.get("tags", [])
+        if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+            raise LibraryValidationError(f"{label} tags must be an array of strings.")
+        prompt.setdefault("category_id", None)
+        prompt.setdefault("negative", "")
+        prompt.setdefault("tags", [])
+
+        for field in ("created_at", "updated_at"):
+            value = prompt.get(field)
+            if value is not None and not isinstance(value, str):
+                raise LibraryValidationError(f"{label} has an invalid {field} value.")
+
+    return data
+
+
+def migrate_legacy_library():
+    """Copy legacy node-local data to the ComfyUI user directory once."""
+    if os.path.exists(LIBRARY_FILE) or not os.path.exists(LEGACY_LIBRARY_FILE):
+        return
+
+    try:
+        with open(LEGACY_LIBRARY_FILE, "r", encoding="utf-8") as legacy_file:
+            legacy_data = validate_library(json.load(legacy_file))
+        save_library(legacy_data)
+    except (OSError, UnicodeError, json.JSONDecodeError, LibraryValidationError):
+        pass
 
 
 def load_library():
-    """Load the prompt library from disk."""
+    """Load the prompt library from the configured ComfyUI user directory."""
+    migrate_legacy_library()
     if os.path.exists(LIBRARY_FILE):
         try:
-            with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+            with open(LIBRARY_FILE, "r", encoding="utf-8") as library_file:
+                return json.load(library_file)
+        except (OSError, UnicodeError, json.JSONDecodeError):
             pass
     return {"categories": [], "prompts": []}
 
 
 def save_library(data):
-    """Save the prompt library to disk."""
-    with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Atomically save the prompt library in the ComfyUI user directory."""
+    directory = os.path.dirname(LIBRARY_FILE)
+    os.makedirs(directory, exist_ok=True)
+    existing_mode = (
+        stat.S_IMODE(os.stat(LIBRARY_FILE).st_mode) if os.path.exists(LIBRARY_FILE) else None
+    )
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix="prompt_library_",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+            json.dump(data, temporary_file, indent=2, ensure_ascii=False)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        if existing_mode is not None:
+            os.chmod(temporary_path, existing_mode)
+        os.replace(temporary_path, LIBRARY_FILE)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def process_random_segments(text, rng=None):
@@ -72,9 +237,20 @@ async def get_library(request):
 
 @routes.post("/prompt_library/data")
 async def save_library_route(request):
-    data = await request.json()
-    save_library(data)
-    return web.json_response({"status": "ok"})
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response(
+            {"status": "error", "error": "The request does not contain valid JSON."}, status=400
+        )
+
+    try:
+        validated_data = validate_library(data)
+    except LibraryValidationError as error:
+        return web.json_response({"status": "error", "error": str(error)}, status=400)
+
+    save_library(validated_data)
+    return web.json_response({"status": "ok", "data": validated_data})
 
 
 @routes.post("/prompt_library/category")
