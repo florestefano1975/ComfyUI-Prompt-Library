@@ -1,3 +1,5 @@
+
+
 # 📚 Prompt Library — ComfyUI Custom Node
 
 A fully-featured prompt manager integrated directly into ComfyUI.
@@ -110,11 +112,11 @@ You can back it up, version-control it, or share it between machines.
 | GET | `/prompt_library/data` | Load full library |
 | POST | `/prompt_library/data` | Replace full library |
 | POST | `/prompt_library/category` | Create category |
-| PUT | `/prompt_library/category/:id` | Update category |
-| DELETE | `/prompt_library/category/:id` | Delete category + all children + their prompts |
+| PUT | `/prompt_library/category/{cat_id}` | Update category |
+| DELETE | `/prompt_library/category/{cat_id}` | Delete category + all children + their prompts |
 | POST | `/prompt_library/prompt` | Create prompt |
-| PUT | `/prompt_library/prompt/:id` | Update prompt |
-| DELETE | `/prompt_library/prompt/:id` | Delete prompt |
+| PUT | `/prompt_library/prompt/{prompt_id}` | Update prompt |
+| DELETE | `/prompt_library/prompt/{prompt_id}` | Delete prompt |
 
 ---
 
